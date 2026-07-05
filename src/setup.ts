@@ -9,8 +9,9 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import boxen from 'boxen';
 import ora from 'ora';
-import { config, AVAILABLE_MODELS, hasApiKey, setApiKey } from './config/index.js';
+import { config, hasApiKey, setApiKey } from './config/index.js';
 import { LLMBackbone } from './llm/index.js';
+import { supportsDiscovery } from './llm/discovery.js';
 import { getBanner } from './index.js';
 
 // =============================================================================
@@ -246,28 +247,60 @@ async function setupOpenAIKey(): Promise<boolean> {
 
 async function selectDefaultModel(): Promise<void> {
   const provider = config.get('defaultProvider');
-  const models = AVAILABLE_MODELS[provider];
 
-  if (!models || models.length === 0) {
-    showWarning('No models available for the current provider');
-    return;
+  // A key/endpoint was just configured, so try the LIVE catalog first; fall back
+  // to the hardcoded seed only if discovery is unavailable or fails.
+  let { models, fromFallback } = config.getModels(provider);
+  if (supportsDiscovery(provider)) {
+    const spinner = ora(`Fetching available models from ${provider}…`).start();
+    const result = await config.refreshModels(provider);
+    if (result.ok) {
+      spinner.succeed(`Fetched ${result.models.length} model(s).`);
+      models = result.models;
+      fromFallback = false;
+    } else {
+      spinner.warn(`Could not fetch live models (${result.error}). Using fallback list.`);
+    }
   }
+
+  if (fromFallback && models.length > 0) {
+    showWarning('Showing a hardcoded fallback list — NOT recommended. Refresh later from Settings for the live catalog.');
+  }
+
+  const MANUAL = '__manual__';
+  const choices = [
+    ...models.map(m => ({
+      name: `${m.name} (${m.id})${m.contextWindow ? ` — ${m.contextWindow.toLocaleString()} tokens` : ''}`,
+      value: m.id,
+    })),
+    { name: '✎ Enter model ID manually', value: MANUAL },
+  ];
 
   const { model } = await inquirer.prompt([
     {
       type: 'list',
       name: 'model',
       message: 'Select your default model:',
-      choices: models.map(m => ({
-        name: `${m.name} (${m.provider}) - ${m.contextWindow.toLocaleString()} tokens`,
-        value: m.id,
-      })),
+      choices,
       default: config.get('defaultModel'),
+      pageSize: 15,
     },
   ]);
 
-  config.setDefaultModel(provider, model);
-  showSuccess(`Default model set to: ${model}`);
+  let chosen = model as string;
+  if (chosen === MANUAL) {
+    const { manualId } = await inquirer.prompt([
+      { type: 'input', name: 'manualId', message: 'Model ID:' },
+    ]);
+    chosen = (manualId as string | undefined)?.trim() || '';
+    if (!chosen) {
+      showWarning('No model entered.');
+      return;
+    }
+  }
+
+  config.setDefaultModel(provider, chosen);
+  showSuccess(`Default model set to: ${chosen}`);
 }
 
 // =============================================================================

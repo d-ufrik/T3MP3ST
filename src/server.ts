@@ -19,6 +19,8 @@ import { createHash, randomUUID } from 'crypto';
 import { config } from './config/index.js';
 import { redactString, redactLedgerText, redactSecrets } from './redact.js';
 import { LLMBackbone } from './llm/index.js';
+import { validateProvider as discoverModels, supportsDiscovery } from './llm/discovery.js';
+import type { LLMProvider } from './types/index.js';
 import { TempestCommand } from './index.js';
 import { OpGeneral } from './general/index.js';
 import type { Directive } from './general/index.js';
@@ -293,10 +295,18 @@ function getTempestCommand(): TempestCommand | null {
   return tempestCommand;
 }
 
-function createTempestCommandInstance(missionName: string, apiKey: string | undefined, provider: string, model: string): TempestCommand {
+function createTempestCommandInstance(missionName: string, apiKey: string | undefined, provider: string, model: string, baseUrl?: string): TempestCommand {
   // Tear down previous instance
   if (tempestCommand) {
     tempestCommand.stop();
+  }
+
+  // Resolve the base URL from the server config when the caller didn't supply one,
+  // so `custom` / local endpoints (and any provider with a configured baseUrl) route
+  // correctly through the operators' LLM, not just the direct-chat path.
+  let effectiveBaseUrl = baseUrl;
+  if (!effectiveBaseUrl) {
+    try { effectiveBaseUrl = config.getLLMConfig(provider as LLMProvider, model).baseUrl; } catch { /* unknown provider — leave undefined */ }
   }
 
   tempestCommand = new TempestCommand({
@@ -305,6 +315,7 @@ function createTempestCommandInstance(missionName: string, apiKey: string | unde
       provider: provider as any,
       model,
       apiKey,
+      baseUrl: effectiveBaseUrl,
       maxTokens: 4096,
       temperature: 0.7,
     },
@@ -5826,6 +5837,30 @@ app.get('/api/llm/status', (_req: Request, res: Response) => {
   });
 });
 
+// Live model discovery for the dashboard — the same /models fetch the CLI uses.
+// Creds are passed per-call from the UI (never persisted here). When the UI omits a
+// base URL, the provider's configured default is used. Non-throwing: an unreachable
+// endpoint returns { ok:false, error } so the UI can fall back to its static list.
+app.post('/api/models', async (req: Request, res: Response): Promise<void> => {
+  const body = req.body as Record<string, unknown>;
+  const provider = typeof body.provider === 'string' ? body.provider : '';
+  const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : '';
+  const apiKey = typeof body.apiKey === 'string' && body.apiKey ? body.apiKey : undefined;
+  if (!provider) { res.status(400).json({ ok: false, error: 'provider required', models: [] }); return; }
+  if (!supportsDiscovery(provider as LLMProvider)) {
+    res.json({ ok: false, error: `Provider "${provider}" has no discoverable model catalog`, models: [] });
+    return;
+  }
+  // Fall back to the server's configured base URL / key when the UI omits them —
+  // lets Refresh work out-of-box in the container (env-injected creds) before the
+  // operator types anything.
+  const serverCfg = config.getLLMConfig(provider as LLMProvider);
+  const effectiveBase = baseUrl || serverCfg.baseUrl || '';
+  const effectiveKey = apiKey || serverCfg.apiKey;
+  const result = await discoverModels({ provider: provider as LLMProvider, baseUrl: effectiveBase, apiKey: effectiveKey });
+  res.json(result);
+});
+
 // =============================================================================
 // TOOL EXECUTION ENDPOINTS
 // =============================================================================
@@ -5888,13 +5923,22 @@ app.get('/api/tools', (_req: Request, res: Response) => {
 app.post('/api/llm/chat', async (req: Request, res: Response): Promise<void> => {
   // Caller-supplied systemPrompt is a local-operator convenience (the UI uses it);
   // safe here because the cross-origin CSRF guard above blocks foreign-webpage drive-by.
-  const { message, systemPrompt } = req.body;
+  const { message, systemPrompt, provider, model, apiKey, baseUrl } = req.body;
   if (!message) { res.status(400).json({ error: 'Message required' }); return; }
-  if (!llm) { res.status(503).json({ error: 'LLM not configured' }); return; }
   try {
-    const response = await llm.prompt(message, systemPrompt);
+    // When the UI sends a provider, build a per-request backbone so the SELECTED
+    // provider (incl. custom/local + nvidia) is honored — the browser can't reach a
+    // local server directly (CORS), so this server-side hop is the routing path.
+    // No provider → fall back to the server's default singleton backbone.
+    let backbone = llm;
+    if (provider) {
+      const cfg = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+      backbone = new LLMBackbone(cfg);
+    }
+    if (!backbone) { res.status(503).json({ error: 'LLM not configured' }); return; }
+    const response = await backbone.prompt(message, systemPrompt);
     res.json({ success: true, response });
-  } catch { res.status(500).json({ error: 'LLM request failed' }); }
+  } catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : 'LLM request failed' }); }
 });
 
 // =============================================================================
@@ -5915,6 +5959,7 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
     apiKey,
     provider = 'openrouter',
     model = 'anthropic/claude-sonnet-4',
+    baseUrl,
     // OPTIONAL white-box source: an absolute path to a LOCAL repo you own. When
     // present, we ingest + security-rank it and hand the packed source to the
     // command via setWhiteboxSource BEFORE start(), so operators reason over the
@@ -5922,12 +5967,13 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
     repoPath,
   } = req.body;
 
-  // Use provided apiKey or fall back to server-configured one. Local-agent backends
-  // (Claude Code / Codex / Hermes) need NO key — the agent uses its own login.
+  // Use provided apiKey or fall back to the SELECTED provider's server-configured key
+  // (not the default provider's). Local-agent backends (Claude Code / Codex / Hermes)
+  // need NO key — the agent uses its own login.
   // SECURITY NOTE: apiKey is read from the request body (Authorization header is
   // preferred). Kept body-accepted for the same-origin UI; only reachable from
   // the local operator (loopback bind + origin guard). Header move is out of scope.
-  const effectiveKey = apiKey || config.getLLMConfig().apiKey;
+  const effectiveKey = apiKey || config.getLLMConfig(provider as LLMProvider).apiKey;
   if (providerNeedsApiKey(provider) && !effectiveKey) {
     res.status(400).json({ error: 'API key required — pass apiKey, configure one on the server, or connect a local agent (Claude Code / Codex / Hermes)' });
     return;
@@ -5962,7 +6008,7 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
   }
 
   try {
-    const cmd = createTempestCommandInstance(name, effectiveKey, provider, model);
+    const cmd = createTempestCommandInstance(name, effectiveKey, provider, model, typeof baseUrl === 'string' ? baseUrl : undefined);
 
     // Add targets
     for (const t of targets) {
@@ -6417,7 +6463,9 @@ app.get('/api/mission/findings', (_req: Request, res: Response) => {
 let activeGeneral: OpGeneral | null = null;
 
 function providerNeedsApiKey(provider: string): boolean {
-  return !['codex', 'mock', 'local', 'local-agent'].includes(provider);
+  // `custom` is a local/self-hosted OpenAI-compatible server whose key is OPTIONAL
+  // (keyless local servers are common); it validates on baseUrl + model instead.
+  return !['codex', 'mock', 'local', 'local-agent', 'custom'].includes(provider);
 }
 
 // SECURITY NOTE: `apiKey` is accepted from the request BODY here (and in the
@@ -6426,10 +6474,11 @@ function providerNeedsApiKey(provider: string): boolean {
 // the key in the body, so we accept it to avoid breaking it. Moving to a header
 // needs a coordinated UI change and is out of scope. The body key is only ever
 // reachable from the local operator (loopback bind + origin guard).
-function resolveGeneralLLMConfig(provider: string, model: string | undefined, apiKey: string | undefined): {
+function resolveGeneralLLMConfig(provider: string, model: string | undefined, apiKey: string | undefined, baseUrl?: string): {
   provider: any;
   model: string;
   apiKey?: string;
+  baseUrl?: string;
   maxTokens: number;
   temperature: number;
   timeout: number;
@@ -6455,6 +6504,9 @@ function resolveGeneralLLMConfig(provider: string, model: string | undefined, ap
     provider: selectedProvider as any,
     model: model || baseConfig.model,
     apiKey: effectiveKey,
+    // Include baseUrl so `custom` / local endpoints route end-to-end (the adapter
+    // needs it). Caller override wins; otherwise the server-config value is used.
+    baseUrl: (baseUrl && baseUrl.trim()) || baseConfig.baseUrl,
     maxTokens: 8192,
     temperature: 0.4,
     timeout: Number(process.env.TEMPEST_GENERAL_TIMEOUT_MS) || 300000, // General planning needs room (was a hardcoded 60s); override via env
@@ -6469,9 +6521,9 @@ function resolveGeneralLLMConfig(provider: string, model: string | undefined, ap
  */
 function bringUpMissionFromPlan(
   execConfig: { missionName: string; targets: string[]; operators: string[] },
-  generalConfig: { apiKey?: string; provider: any; model: string },
+  generalConfig: { apiKey?: string; provider: any; model: string; baseUrl?: string },
 ): { spawnedOps: Array<{ id: string; callsign: string; archetype: string }>; status: any } {
-  const cmd = createTempestCommandInstance(execConfig.missionName, generalConfig.apiKey, generalConfig.provider, generalConfig.model);
+  const cmd = createTempestCommandInstance(execConfig.missionName, generalConfig.apiKey, generalConfig.provider, generalConfig.model, generalConfig.baseUrl);
   for (const target of execConfig.targets) {
     if (target.startsWith('http://') || target.startsWith('https://')) cmd.targetEnv.addTarget(createTargetFromUrl(target));
     else if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(target)) cmd.targetEnv.addTarget(createTargetFromIP(target));

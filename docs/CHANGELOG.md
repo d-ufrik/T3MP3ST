@@ -1,5 +1,130 @@
 # T3MP3ST Changelog
 
+## 2026-07-05 — Local-model-friendly + standardized model discovery
+
+Made T3MP3ST first-class for local / self-hosted OpenAI-compatible inference and
+replaced the hardcoded model catalog with live discovery. Full plan and phase
+log in `docs/LOCAL_MODEL_REFACTOR.md`; usage in `docs/LOCAL_MODELS.md`.
+
+### Added
+
+- **`custom` provider** — any local/self-hosted OpenAI-compatible server (local server,
+  vLLM, llama.cpp, LM Studio, Ollama's OpenAI shim, …). Configured on baseUrl
+  alone; the API key is **optional** (keyless local servers supported).
+- **`nvidia` provider** — NVIDIA NIM (`https://integrate.api.nvidia.com/v1`),
+  preconfigured alongside openrouter/venice/anthropic/openai.
+- **Live model discovery** (`src/llm/discovery.ts`) — fetches the model list from
+  the provider's own `/models` route (OpenAI-compatible) or `/v1/models`
+  (Anthropic). Results cached (24h TTL, keyed by baseUrl); the hardcoded
+  `AVAILABLE_MODELS` list is now **fallback only**, flagged "not recommended" in
+  the UI.
+- **Editable base URL** in the settings menu and setup wizard — point any
+  provider at a local endpoint. Dynamic model picker with live refresh and a
+  manual model-id escape hatch.
+- **CLI commands** — `validate [provider]`, `refresh-models [-p provider]`, and
+  `models --refresh` (all exit 0/1 for scripting/Docker health checks).
+- **Env drivability** — `LLM_PROVIDER` / `LLM_MODEL` now actually select the
+  backbone; `CUSTOM_BASE_URL` / `CUSTOM_MODEL` / `CUSTOM_API_KEY` + per-provider
+  `*_BASE_URL` overrides.
+
+### Security
+
+- **Removed a live API key baked into the Docker image** (`Dockerfile:41`). The
+  image now ships only **mock placeholders**; the real key is injected at runtime
+  by `scripts/docker-entrypoint.sh` and never lands in an image layer.
+- **`exportConfig` now redacts every stored key generically** — previously it
+  listed providers by hand and would have leaked/omitted venice/nvidia/custom.
+
+### Fixed
+
+- Discovery is **non-blocking**: a down endpoint / 401 / missing `/models` route
+  degrades to fallback + manual entry, never crashing the CLI or server boot.
+- Keyless `custom` no longer disabled by the server's key gate
+  (`providerNeedsApiKey`).
+
+### Web dashboard (`docs/index.html`, served at `/ui`)
+
+The dashboard is a standalone client-side app (localStorage state, its own model
+list) — separate from the CLI/backend, so the above did not surface in it until
+this pass. Added there:
+
+- **NVIDIA API Key** section and a **Custom / Local Server** section (editable
+  base URL + optional key, "Save & Test").
+- **Live model selector** — provider dropdown + **↻ Refresh** that fetches the
+  live catalog from the new `POST /api/models` server endpoint, a status line
+  (`✓ N live model(s)` vs `⚠ hardcoded fallback`), and a manual model-id entry.
+- New server endpoint **`POST /api/models`** `{provider, baseUrl, apiKey}` — runs
+  the discovery module server-side (avoids browser CORS; falls back to the
+  server-configured baseUrl/key when the UI omits them).
+
+### Fixed — the routing bug (critical; see `docs/ROUTING_FIX.md`)
+
+**Symptom:** selecting a provider/model in the UI did nothing — every LLM call
+still went to OpenRouter (or failed), so `custom`/local never actually ran.
+
+**Root causes (all fixed):**
+1. `resolveGeneralLLMConfig` (server) built the config from `config.getLLMConfig`
+   but **dropped `baseUrl` from its return object** — so `custom` reached the
+   adapter with no base URL and failed. Now returns `baseUrl` (caller override →
+   server config), and accepts a `baseUrl` param.
+2. `createTempestCommandInstance` (server) never carried `baseUrl` → mission
+   **operators** couldn't reach a local server. Now threads it (from arg or
+   server config).
+3. `/api/mission/start` and `/api/llm/chat` (server) ignored per-request
+   provider/baseUrl. Now honor `{provider, model, apiKey, baseUrl}` from the body
+   and fall back to the SELECTED provider's server config (not the default's).
+4. Client `getApiKey()` returned only the **openrouter** key; `getGeneralConfig()`
+   ignored the selected provider; the mission path **inferred** the provider from
+   the key prefix (defaulting to openrouter); and `_safeLLMCallOnce` called
+   `https://openrouter.ai/...` **hardcoded** from the browser. Replaced with a
+   single `llmRequestConfig()` (selected provider + its key + baseUrl) used by
+   mission dispatch, Admiral, and chat; chat now routes through the server when
+   the backend is connected (CORS-free, honors custom/local).
+
+### Security
+
+- **Removed a live API key baked into the Docker image** (`Dockerfile:41`). The
+  image now ships only **mock placeholders**; the real key is injected at runtime
+  by `scripts/docker-entrypoint.sh` and never lands in an image layer.
+- **`exportConfig` now redacts every stored key generically** — previously it
+  listed providers by hand and would have leaked/omitted venice/nvidia/custom.
+
+### Fixed (other)
+
+- Discovery is **non-blocking**: a down endpoint / 401 / missing `/models` route
+  degrades to fallback + manual entry, never crashing the CLI or server boot.
+- Keyless `custom` no longer disabled by the server's key gate
+  (`providerNeedsApiKey`).
+
+### Ops notes
+
+- The Dockerfile's `ENV PORT` is unused — the server reads **`T3MP3ST_PORT`**
+  (default 3333). Documented, not changed.
+- `.local` mDNS does not resolve inside containers. Deploy with
+  `--add-host your-server.local:192.0.2.10` (or use the IP). See `docs/DEPLOYMENT.md`.
+
+### Verified (see `docs/TESTING.md`)
+
+- **304 unit tests pass** (12 new: both wire shapes, cache baseUrl-keying, keyless
+  custom, non-throwing headless-fallback). Typecheck clean; new files lint clean.
+- Live against a real local OpenAI-compatible server (`your-server.local:8080` = `192.0.2.10`):
+  - `validate custom` / `models -p custom --refresh` → **63 models** from `/v1/models`.
+  - `POST /api/models` (container) → **63 models** (server-key fallback).
+  - `POST /api/llm/chat {provider:"custom"}` (container) → real completion
+    **`CONTAINER_ROUTED`** from the local model — proving end-to-end routing.
+- Container builds secret-free, boots healthy, non-blocking on an unreachable
+  endpoint.
+
+### Files
+
+- New: `src/llm/discovery.ts`, `Dockerfile`, `scripts/docker-entrypoint.sh`,
+  `docs/LOCAL_MODELS.md`, `docs/LOCAL_MODEL_REFACTOR.md`, `docs/ROUTING_FIX.md`,
+  `docs/TESTING.md`, `docs/DEPLOYMENT.md`, `docs/SESSION_2026-07-05.md`,
+  `src/__tests__/model-discovery.test.ts`, `src/__tests__/custom-provider.test.ts`.
+- Changed: `src/types/index.ts`, `src/config/index.ts`, `src/llm/index.ts`,
+  `src/server.ts`, `src/cli.ts`, `src/setup.ts`, `docs/index.html`,
+  `docs/CHANGELOG.md`; outer `docs/PROJECT.md` (config-surface reconciliation).
+
 ## 2026-05-28 — Cognitive v3 + Integrity Hardening
 
 A focused self-improvement pass on the Cybench harness, motivated by

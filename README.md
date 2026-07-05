@@ -24,6 +24,21 @@
 
 Point T3MP3ST at an authorized target and the kill chain is yours — **recon → exploit → report**, from a web War Room or the CLI, driven by the AI coding agent you're already signed into (Claude Code, Codex, Hermes). No new API keys, no cloud, no second bill. Your agent is the brain; T3MP3ST is the war machine you bolt around it. Self-hosted storm, keyless warfare. ⚡
 
+---
+
+## 🔱 What's different in this fork ([d-ufrik/T3MP3ST](https://github.com/d-ufrik/T3MP3ST))
+
+This fork adds **local-inference support and live model discovery** on top of upstream:
+
+- **Use your own local inference.** Point T3MP3ST at anything **OpenAI-compatible** you've already deployed (vLLM, llama.cpp, LM Studio, Ollama's OpenAI shim, an in-house proxy) via a new **`custom`** provider — set a base URL, key optional (keyless servers work).
+- **Added NVIDIA as a provider** — NVIDIA NIM (`integrate.api.nvidia.com/v1`), because the API keys are free. 😄
+- **Model retrieval instead of hardcoded lists** — fetches the latest model list straight from each provider's own `/models` endpoint, so the catalog is never stale (the old hardcoded list is now just an offline fallback).
+- **Fixed a routing bug** where everything defaulted through OpenRouter regardless of the selected provider — now the provider you pick actually drives missions, the Admiral, and chat (incl. your local box).
+
+Full details: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) · local setup: [`docs/LOCAL_MODELS.md`](docs/LOCAL_MODELS.md) · the routing fix: [`docs/ROUTING_FIX.md`](docs/ROUTING_FIX.md) · Docker/ops: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). No secrets ship in the image — keys are injected at runtime.
+
+---
+
 The recon engine is live and tool-backed, and the exploit loop is benchmark-proven: **90.1% pass@1 on XBEN** — XBOW's own 104-challenge suite — every solve graded against a committed flag oracle that `verify-claims` recomputes on demand (reproducible below). Then it went hunting COLD on a **held-out set of 10 real CVEs disclosed in 2026, across 7 languages** — post-cutoff bugs the hardened prompts were never tuned on. A single agent **pinned 8/10 to the exact file, line, and CWE** (verified all-exact, stable under re-scoring), and the full pack surfaced all 10 (`verify-claims` recomputes it from the raw findings; small n, reported honestly as directional). Memorization *and* overfitting, both off the table. The full 8-operator swarm is the architecture it grows into; the [status table](#what-ships-today) is exact about what's live, what's scaffolding, and what's still roadmap. Loud about the mission, honest about where the build is.
 
 Three things set it apart:

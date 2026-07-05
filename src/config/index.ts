@@ -10,10 +10,19 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { LLMProvider, LLMConfig, FallbackEntry, OpsecLevel } from '../types/index.js';
+import { validateProvider as discoverModels, supportsDiscovery, type ValidationResult } from '../llm/discovery.js';
 
 // =============================================================================
 // CONFIGURATION SCHEMA
 // =============================================================================
+
+/**
+ * Providers that authenticate with a stored/env API key. `custom` is a local /
+ * self-hosted OpenAI-compatible endpoint (its key is optional — many local
+ * servers are keyless). Codex/mock/local/local-agent are excluded: they use CLI
+ * auth or no auth at all.
+ */
+export type ApiKeyProvider = 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'nvidia' | 'custom';
 
 export interface TempestSettings {
   // API Keys
@@ -22,6 +31,8 @@ export interface TempestSettings {
     venice?: string;
     anthropic?: string;
     openai?: string;
+    nvidia?: string;
+    custom?: string;
   };
 
   // Default LLM settings
@@ -54,6 +65,21 @@ export interface TempestSettings {
     defaultModel: string;
   };
 
+  // NVIDIA NIM — OpenAI-compatible (Bearer auth, /chat/completions, /models).
+  // Model ids are HuggingFace-style vendor/name (e.g. meta/llama-3.3-70b-instruct).
+  nvidia: {
+    baseUrl: string;
+    defaultModel: string;
+  };
+
+  // Custom — any local / self-hosted OpenAI-compatible server (vLLM,
+  // llama.cpp, LM Studio, Ollama's OpenAI shim, …). Same wire shape as OpenAI.
+  // The API key is optional; keyless local servers just leave it unset.
+  custom: {
+    baseUrl: string;
+    defaultModel: string;
+  };
+
   // Codex CLI/account subscription backend
   codex: {
     command: string;
@@ -78,6 +104,20 @@ export interface TempestSettings {
     colorOutput: boolean;
     verboseLogging: boolean;
   };
+
+  // Live model discovery cache. Keyed by provider; each entry records the
+  // baseUrl it was fetched from so switching endpoints never surfaces a stale
+  // catalog (see ConfigManager.getCachedModels). Populated by the llm layer's
+  // discovery — the hardcoded AVAILABLE_MODELS list is only a fallback.
+  modelCache: Record<string, ModelCacheEntry>;
+}
+
+/** One provider's cached live model list, tagged with its source endpoint. */
+export interface ModelCacheEntry {
+  models: ModelInfo[];
+  baseUrl: string;
+  /** epoch ms of the fetch; used for TTL expiry. */
+  fetchedAt: number;
 }
 
 // =============================================================================
@@ -112,6 +152,18 @@ const DEFAULT_SETTINGS: TempestSettings = {
     defaultModel: 'gpt-4-turbo-preview',
   },
 
+  nvidia: {
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    defaultModel: 'meta/llama-3.3-70b-instruct',
+  },
+
+  // No default endpoint — a custom server only exists once the operator sets its
+  // baseUrl (via settings, or the CUSTOM_BASE_URL env var). Model is discovered.
+  custom: {
+    baseUrl: '',
+    defaultModel: '',
+  },
+
   codex: {
     command: 'codex',
     defaultModel: 'codex-default',
@@ -132,6 +184,8 @@ const DEFAULT_SETTINGS: TempestSettings = {
     colorOutput: true,
     verboseLogging: false,
   },
+
+  modelCache: {},
 };
 
 // =============================================================================
@@ -369,6 +423,31 @@ export const AVAILABLE_MODELS: Record<LLMProvider, ModelInfo[]> = {
       capabilities: ['reasoning', 'code', 'analysis', 'vision', 'fast'],
     },
   ],
+  // NVIDIA NIM — minimal fallback seed only; the live catalog is large and
+  // changes often, so discovery (GET /models) is the real source. Ids are
+  // HuggingFace-style vendor/name.
+  nvidia: [
+    {
+      id: 'meta/llama-3.3-70b-instruct',
+      name: 'Llama 3.3 70B Instruct (NIM)',
+      provider: 'NVIDIA',
+      contextWindow: 131072,
+      maxOutput: 8192,
+      capabilities: ['reasoning', 'code', 'analysis'],
+    },
+    {
+      id: 'deepseek-ai/deepseek-r1',
+      name: 'DeepSeek R1 (NIM)',
+      provider: 'NVIDIA',
+      contextWindow: 131072,
+      maxOutput: 8192,
+      capabilities: ['reasoning', 'code', 'analysis', 'complex-tasks'],
+    },
+  ],
+  // Custom endpoints are discovered live from the server's /models route; there
+  // is no meaningful static seed. Empty here means the UI relies entirely on
+  // discovery, with manual model-id entry as the escape hatch.
+  custom: [],
   codex: [
     {
       id: 'codex-default',
@@ -482,12 +561,23 @@ class ConfigManager {
       }
     }
 
-    // Check environment variables for API keys
+    // Check environment variables for API keys and base URLs
     const envKeys = {
       openrouter: process.env.OPENROUTER_API_KEY,
       venice: process.env.VENICE_API_KEY,
       anthropic: process.env.ANTHROPIC_API_KEY,
       openai: process.env.OPENAI_API_KEY,
+      nvidia: process.env.NVIDIA_API_KEY,
+      custom: process.env.CUSTOM_API_KEY,
+    };
+
+    const envBaseUrls = {
+      openrouter: process.env.OPENROUTER_BASE_URL,
+      venice: process.env.VENICE_BASE_URL,
+      anthropic: process.env.ANTHROPIC_BASE_URL,
+      openai: process.env.OPENAI_API_BASE,
+      nvidia: process.env.NVIDIA_BASE_URL,
+      custom: process.env.CUSTOM_BASE_URL,
     };
 
     // Only set from env if not already set in config
@@ -495,8 +585,36 @@ class ConfigManager {
 
     for (const [provider, envKey] of Object.entries(envKeys)) {
       if (envKey && !currentKeys[provider as keyof typeof currentKeys]) {
-        this.setApiKey(provider as 'openrouter' | 'venice' | 'anthropic' | 'openai', envKey);
+        this.setApiKey(provider as ApiKeyProvider, envKey);
       }
+    }
+
+    // Override baseUrl from env if set (takes precedence over config)
+    for (const [provider, envUrl] of Object.entries(envBaseUrls)) {
+      if (envUrl) {
+        const key = provider as keyof typeof this.config.store;
+        const section = this.config.store[key];
+        if (section && typeof section === 'object' && 'baseUrl' in section) {
+          this.config.set(key, { ...section, baseUrl: envUrl });
+        }
+      }
+    }
+
+    // Custom endpoint model can be pinned headlessly (Docker) with CUSTOM_MODEL —
+    // no /models call required for the container to boot with a working model.
+    const envCustomModel = process.env.CUSTOM_MODEL;
+    if (envCustomModel) {
+      this.config.set('custom', { ...this.config.get('custom'), defaultModel: envCustomModel });
+    }
+
+    // Explicit backbone override (documented in .env.example / Dockerfile):
+    // LLM_PROVIDER selects the default provider; LLM_MODEL its default model.
+    // Applied last so env wins. Unknown provider values are ignored (never break boot).
+    const envProvider = process.env.LLM_PROVIDER?.trim();
+    if (envProvider && envProvider in AVAILABLE_MODELS) {
+      this.setDefaultProvider(envProvider as LLMProvider);
+      const envModel = process.env.LLM_MODEL?.trim();
+      if (envModel) this.setDefaultModel(envProvider as LLMProvider, envModel);
     }
 
     this.envLoaded = true;
@@ -526,7 +644,7 @@ class ConfigManager {
   /**
    * Set an API key for a provider
    */
-  setApiKey(provider: 'openrouter' | 'venice' | 'anthropic' | 'openai', key: string): void {
+  setApiKey(provider: ApiKeyProvider, key: string): void {
     const apiKeys = this.config.get('apiKeys');
     apiKeys[provider] = key;
     this.config.set('apiKeys', apiKeys);
@@ -535,13 +653,15 @@ class ConfigManager {
   /**
    * Get an API key for a provider
    */
-  getApiKey(provider: 'openrouter' | 'venice' | 'anthropic' | 'openai'): string | undefined {
+  getApiKey(provider: ApiKeyProvider): string | undefined {
     // First check environment variables (highest priority)
-    const envVarMap = {
+    const envVarMap: Record<ApiKeyProvider, string> = {
       openrouter: 'OPENROUTER_API_KEY',
       venice: 'VENICE_API_KEY',
       anthropic: 'ANTHROPIC_API_KEY',
       openai: 'OPENAI_API_KEY',
+      nvidia: 'NVIDIA_API_KEY',
+      custom: 'CUSTOM_API_KEY',
     };
 
     // Force a fully UNCONFIGURED server (no key from env OR the saved store) — used by
@@ -560,7 +680,7 @@ class ConfigManager {
   /**
    * Check if a provider has a valid API key configured
    */
-  hasApiKey(provider: 'openrouter' | 'venice' | 'anthropic' | 'openai'): boolean {
+  hasApiKey(provider: ApiKeyProvider): boolean {
     const key = this.getApiKey(provider);
     return !!key && key.length > 10;
   }
@@ -568,7 +688,7 @@ class ConfigManager {
   /**
    * Remove an API key
    */
-  removeApiKey(provider: 'openrouter' | 'venice' | 'anthropic' | 'openai'): void {
+  removeApiKey(provider: ApiKeyProvider): void {
     const apiKeys = this.config.get('apiKeys');
     delete apiKeys[provider];
     this.config.set('apiKeys', apiKeys);
@@ -584,6 +704,11 @@ class ConfigManager {
     if (this.hasApiKey('venice')) providers.push('venice');
     if (this.hasApiKey('anthropic')) providers.push('anthropic');
     if (this.hasApiKey('openai')) providers.push('openai');
+    if (this.hasApiKey('nvidia')) providers.push('nvidia');
+
+    // Custom OpenAI-compatible server is "configured" as soon as a baseUrl is set —
+    // the API key is optional (keyless local servers are common).
+    if (this.config.get('custom').baseUrl) providers.push('custom');
 
     // Codex uses the local Codex CLI/account auth instead of API-key storage.
     providers.push('codex');
@@ -625,6 +750,16 @@ class ConfigManager {
         baseUrl = this.config.get('openai').baseUrl;
         actualModel = model || this.config.get('openai').defaultModel;
         break;
+      case 'nvidia':
+        apiKey = this.getApiKey('nvidia');
+        baseUrl = this.config.get('nvidia').baseUrl;
+        actualModel = model || this.config.get('nvidia').defaultModel;
+        break;
+      case 'custom':
+        apiKey = this.getApiKey('custom');   // may be undefined — keyless local servers
+        baseUrl = this.config.get('custom').baseUrl;
+        actualModel = model || this.config.get('custom').defaultModel;
+        break;
       case 'codex':
         actualModel = model || this.config.get('codex').defaultModel;
         break;
@@ -659,14 +794,18 @@ class ConfigManager {
    * providers in priority order (openrouter → venice → anthropic → openai), each with its own
    * key/model. OFF by default (no surprise model-switching). On a refusal the real
    * authorization context is restated — honest escalation, no jailbreak prompts
-   * (see LLMBackbone.chat).
+   * (see LLMBackbone.chat). Priority order: openrouter → venice → anthropic →
+   * openai → nvidia → custom.
    */
   private buildFallbackChain(primary: LLMProvider): FallbackEntry[] {
     const flag = (process.env.TEMPEST_MODEL_FALLBACK || '').trim().toLowerCase();
     if (!flag || ['0', 'false', 'off', 'no'].includes(flag)) return [];
     const chain: FallbackEntry[] = [];
-    const add = (p: 'openrouter' | 'venice' | 'anthropic' | 'openai') => {
-      if (p === primary || !this.hasApiKey(p)) return;
+    const add = (p: ApiKeyProvider) => {
+      if (p === primary) return;
+      // custom joins the ladder on baseUrl alone (key optional); the rest need a key.
+      const usable = p === 'custom' ? !!this.config.get('custom').baseUrl : this.hasApiKey(p);
+      if (!usable) return;
       chain.push({
         provider: p,
         model: this.config.get(p).defaultModel,
@@ -678,7 +817,92 @@ class ConfigManager {
     add('venice');
     add('anthropic');
     add('openai');
+    add('nvidia');
+    add('custom');
     return chain;
+  }
+
+  // ===========================================================================
+  // BASE URL + MODEL DISCOVERY / CACHE
+  // ===========================================================================
+
+  /** Model discovery cache TTL: 24h. A stale/mismatched entry is ignored (see getCachedModels). */
+  private readonly MODEL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+  /** Currently-configured base URL for a provider that has one. */
+  private baseUrlFor(provider: LLMProvider): string {
+    switch (provider) {
+      case 'openrouter': return this.config.get('openrouter').baseUrl;
+      case 'venice': return this.config.get('venice').baseUrl;
+      case 'anthropic': return this.config.get('anthropic').baseUrl;
+      case 'openai': return this.config.get('openai').baseUrl;
+      case 'nvidia': return this.config.get('nvidia').baseUrl;
+      case 'custom': return this.config.get('custom').baseUrl;
+      default: return '';
+    }
+  }
+
+  /**
+   * Persist the base URL for a provider. This is what makes T3MP3ST point at a
+   * local OpenAI-compatible server; env vars (OPENROUTER_BASE_URL / OPENAI_API_BASE
+   * / CUSTOM_BASE_URL / …) still override the stored value at load time.
+   */
+  setBaseUrl(provider: ApiKeyProvider, baseUrl: string): void {
+    switch (provider) {
+      case 'openrouter': this.config.set('openrouter', { ...this.config.get('openrouter'), baseUrl }); break;
+      case 'venice': this.config.set('venice', { ...this.config.get('venice'), baseUrl }); break;
+      case 'anthropic': this.config.set('anthropic', { ...this.config.get('anthropic'), baseUrl }); break;
+      case 'openai': this.config.set('openai', { ...this.config.get('openai'), baseUrl }); break;
+      case 'nvidia': this.config.set('nvidia', { ...this.config.get('nvidia'), baseUrl }); break;
+      case 'custom': this.config.set('custom', { ...this.config.get('custom'), baseUrl }); break;
+    }
+  }
+
+  /** Live cached models IF fresh AND fetched from the current baseUrl; else null. */
+  getCachedModels(provider: LLMProvider): ModelInfo[] | null {
+    const entry = this.config.get('modelCache')[provider];
+    if (!entry) return null;
+    if (entry.baseUrl !== this.baseUrlFor(provider)) return null;          // endpoint changed
+    if (Date.now() - entry.fetchedAt > this.MODEL_CACHE_TTL_MS) return null; // expired
+    return entry.models;
+  }
+
+  private writeModelCache(provider: LLMProvider, models: ModelInfo[]): void {
+    const cache = { ...this.config.get('modelCache') };
+    cache[provider] = { models, baseUrl: this.baseUrlFor(provider), fetchedAt: Date.now() };
+    this.config.set('modelCache', cache);
+  }
+
+  /**
+   * Models to show in the picker: a fresh live cache when available, otherwise the
+   * hardcoded AVAILABLE_MODELS seed. `fromFallback` drives the UI's "hardcoded —
+   * not recommended, refresh for live models" notice.
+   */
+  getModels(provider: LLMProvider): { models: ModelInfo[]; fromFallback: boolean } {
+    const cached = this.getCachedModels(provider);
+    if (cached && cached.length > 0) return { models: cached, fromFallback: false };
+    return { models: AVAILABLE_MODELS[provider] ?? [], fromFallback: true };
+  }
+
+  /**
+   * Validate a provider's endpoint (and key, if any) by hitting its /models route,
+   * and on success cache the live catalog. This IS the refresh path — it always
+   * fetches live and bypasses the TTL. Non-throwing: failures come back as
+   * { ok:false, error } so neither the CLI nor a headless boot is ever crashed by
+   * an unreachable endpoint. Delegates the HTTP to the llm/discovery layer.
+   */
+  async refreshModels(provider: LLMProvider, model?: string): Promise<ValidationResult> {
+    if (!supportsDiscovery(provider)) {
+      return { ok: false, error: `Provider "${provider}" has no discoverable model catalog`, models: [] };
+    }
+    const cfg = this.getLLMConfig(provider, model);
+    const result = await discoverModels({
+      provider,
+      baseUrl: cfg.baseUrl ?? '',
+      apiKey: cfg.apiKey,
+    });
+    if (result.ok) this.writeModelCache(provider, result.models);
+    return result;
   }
 
   /**
@@ -700,6 +924,12 @@ class ConfigManager {
         break;
       case 'openai':
         this.config.set('defaultModel', this.config.get('openai').defaultModel);
+        break;
+      case 'nvidia':
+        this.config.set('defaultModel', this.config.get('nvidia').defaultModel);
+        break;
+      case 'custom':
+        this.config.set('defaultModel', this.config.get('custom').defaultModel);
         break;
       case 'codex':
         this.config.set('defaultModel', this.config.get('codex').defaultModel);
@@ -723,6 +953,12 @@ class ConfigManager {
         break;
       case 'openai':
         this.config.set('openai', { ...this.config.get('openai'), defaultModel: model });
+        break;
+      case 'nvidia':
+        this.config.set('nvidia', { ...this.config.get('nvidia'), defaultModel: model });
+        break;
+      case 'custom':
+        this.config.set('custom', { ...this.config.get('custom'), defaultModel: model });
         break;
       case 'codex':
         this.config.set('codex', { ...this.config.get('codex'), defaultModel: model });
@@ -753,15 +989,13 @@ class ConfigManager {
    */
   exportConfig(filePath: string): void {
     const settings = this.getAll();
-    // Remove sensitive data
-    const safeSettings = {
-      ...settings,
-      apiKeys: {
-        openrouter: settings.apiKeys.openrouter ? '***REDACTED***' : undefined,
-        anthropic: settings.apiKeys.anthropic ? '***REDACTED***' : undefined,
-        openai: settings.apiKeys.openai ? '***REDACTED***' : undefined,
-      },
-    };
+    // Redact EVERY stored key generically so a new provider can never leak by
+    // being forgotten here (previously venice/nvidia/custom would have slipped through).
+    const redactedKeys: Record<string, string> = {};
+    for (const [provider, key] of Object.entries(settings.apiKeys)) {
+      if (key) redactedKeys[provider] = '***REDACTED***';
+    }
+    const safeSettings = { ...settings, apiKeys: redactedKeys };
     writeFileSync(filePath, JSON.stringify(safeSettings, null, 2));
   }
 
@@ -783,6 +1017,20 @@ ANTHROPIC_API_KEY=
 # OpenAI API Key
 # Get your key at: https://platform.openai.com/api-keys
 OPENAI_API_KEY=
+
+# NVIDIA NIM API Key (OpenAI-compatible catalog)
+# Get your key at: https://build.nvidia.com/
+NVIDIA_API_KEY=
+
+# Custom / local OpenAI-compatible server (vLLM, llama.cpp, LM Studio, …)
+# Set LLM_PROVIDER=custom to use it. Key is optional for keyless local servers.
+# CUSTOM_BASE_URL=http://localhost:8080/v1
+# CUSTOM_MODEL=your-local-model
+# CUSTOM_API_KEY=
+
+# Optional: override any provider's base URL (point at a local/proxy endpoint)
+# OPENROUTER_BASE_URL=   VENICE_BASE_URL=   ANTHROPIC_BASE_URL=
+# OPENAI_API_BASE=       NVIDIA_BASE_URL=
 `;
     writeFileSync(filePath, template);
   }
@@ -795,8 +1043,11 @@ OPENAI_API_KEY=
 export const config = new ConfigManager();
 
 // Helper functions for quick access
-export const getApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai') => config.getApiKey(provider);
-export const setApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai', key: string) => config.setApiKey(provider, key);
-export const hasApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai') => config.hasApiKey(provider);
+export const getApiKey = (provider: ApiKeyProvider) => config.getApiKey(provider);
+export const setApiKey = (provider: ApiKeyProvider, key: string) => config.setApiKey(provider, key);
+export const hasApiKey = (provider: ApiKeyProvider) => config.hasApiKey(provider);
 export const getLLMConfig = (provider?: LLMProvider, model?: string) => config.getLLMConfig(provider, model);
 export const getConfiguredProviders = () => config.getConfiguredProviders();
+export const setBaseUrl = (provider: ApiKeyProvider, baseUrl: string) => config.setBaseUrl(provider, baseUrl);
+export const getModels = (provider: LLMProvider) => config.getModels(provider);
+export const refreshModels = (provider: LLMProvider, model?: string) => config.refreshModels(provider, model);

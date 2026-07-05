@@ -1,0 +1,38 @@
+# Build artifacts
+node_modules
+npm-debug.log*
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE & editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+
+# Git
+.git
+.gitignore
+
+# Docs (copy only index.html, exclude markdown docs)
+docs/
+!docs/index.html
+
+VISION.md
+WHITEPAPER.md
+FEATURES.md
+CHANGELOG.md
+README.md
+SECURITY_AUDIT_REPORT.md
+DOCKER_CONTEXT_ISSUES.md
+DOCKERFILE.md
+INSTALL_MATRIX.md
+INSTALL.md
+LICENSE

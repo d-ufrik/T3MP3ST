@@ -201,14 +201,18 @@ class OpenRouterAdapter implements LLMProviderAdapter {
     const tools = this.formatTools(options?.tools);
     if (tools) requestBody.tools = tools;
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'HTTP-Referer': siteUrl,
+      'X-Title': siteName,
+    };
+    // Bearer only when a key exists — keyless local OpenAI-compatible servers
+    // (via the `custom` provider) must not receive `Authorization: Bearer undefined`.
+    if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.config.apiKey}`,
-        'HTTP-Referer': siteUrl,
-        'X-Title': siteName,
-      },
+      headers,
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(this.config.timeout || 60000),
     });
@@ -283,14 +287,15 @@ class OpenRouterAdapter implements LLMProviderAdapter {
     // is aborted (after config.timeout, default 60s of no data).
     const controller = new AbortController();
     const idleMs = this.config.timeout || 60000;
+    const streamHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'HTTP-Referer': siteUrl,
+      'X-Title': siteName,
+    };
+    if (this.config.apiKey) streamHeaders.Authorization = `Bearer ${this.config.apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.config.apiKey}`,
-        'HTTP-Referer': siteUrl,
-        'X-Title': siteName,
-      },
+      headers: streamHeaders,
       body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
@@ -354,6 +359,47 @@ class VeniceAdapter extends OpenRouterAdapter {
       return {
         valid: false,
         error: 'Venice API key is required. Get one at https://venice.ai/settings/api',
+      };
+    }
+    return { valid: true };
+  }
+}
+
+// NVIDIA NIM (integrate.api.nvidia.com) is OpenAI-compatible on the wire (Bearer
+// auth, POST /chat/completions, GET /models), so it reuses the OpenRouter adapter
+// and differs only in name + key-required message. Model ids are HF-style vendor/name.
+class NvidiaAdapter extends OpenRouterAdapter {
+  name = 'nvidia';
+
+  validateConfig(): { valid: boolean; error?: string } {
+    if (!this.config.apiKey) {
+      return {
+        valid: false,
+        error: 'NVIDIA API key is required. Get one at https://build.nvidia.com/ (NGC / API Catalog).',
+      };
+    }
+    return { valid: true };
+  }
+}
+
+// A `custom` provider is any local / self-hosted OpenAI-compatible server (local server,
+// vLLM, llama.cpp, LM Studio, Ollama's OpenAI shim, …). Same wire as OpenRouter,
+// so it reuses the whole adapter; it differs only in requiring a base URL instead
+// of a key (the key is OPTIONAL — the parent omits the Bearer header when absent).
+class CustomAdapter extends OpenRouterAdapter {
+  name = 'custom';
+
+  validateConfig(): { valid: boolean; error?: string } {
+    if (!this.config.baseUrl) {
+      return {
+        valid: false,
+        error: 'Custom provider requires a base URL (e.g. http://localhost:8080/v1). Set it in Settings or via CUSTOM_BASE_URL.',
+      };
+    }
+    if (!this.config.model) {
+      return {
+        valid: false,
+        error: 'Custom provider requires a model. Pick one after refreshing models, or set CUSTOM_MODEL.',
       };
     }
     return { valid: true };
@@ -1025,6 +1071,10 @@ export class LLMBackbone extends EventEmitter<LLMEvents> {
         return new AnthropicAdapter(config);
       case 'openai':
         return new OpenAIAdapter(config);
+      case 'nvidia':
+        return new NvidiaAdapter(config);
+      case 'custom':
+        return new CustomAdapter(config);
       case 'codex':
         return new CodexAdapter(config);
       case 'mock':

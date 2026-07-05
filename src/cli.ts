@@ -28,11 +28,20 @@ import {
   config,
   hasApiKey,
   setApiKey,
+  setBaseUrl,
   getConfiguredProviders,
-  AVAILABLE_MODELS,
+  getModels,
+  refreshModels,
+  type ApiKeyProvider,
+  type ModelInfo,
 } from './config/index.js';
+import type { LLMProvider } from './types/index.js';
+import { supportsDiscovery } from './llm/discovery.js';
 
 import { LLMBackbone } from './llm/index.js';
+
+// Providers that own an editable base URL + discoverable model catalog.
+const ENDPOINT_PROVIDERS: ApiKeyProvider[] = ['openrouter', 'venice', 'anthropic', 'openai', 'nvidia', 'custom'];
 
 // =============================================================================
 // DISPLAY HELPERS
@@ -496,6 +505,90 @@ async function generateReport(tempest: Tempest): Promise<void> {
   }
 }
 
+/**
+ * Validate a provider's endpoint (+ key, if any) and cache its live model list,
+ * with a spinner. Returns the models on success; on failure prints the error and
+ * returns null so the caller can fall back to the static seed / manual entry.
+ */
+async function refreshModelsInteractive(provider: LLMProvider, model?: string): Promise<ModelInfo[] | null> {
+  if (!supportsDiscovery(provider)) {
+    showInfo(`${provider} has no discoverable model catalog — enter the model id manually.`);
+    return null;
+  }
+  const spinner = ora(`Validating ${provider} endpoint and fetching models…`).start();
+  const result = await refreshModels(provider, model);
+  if (result.ok) {
+    spinner.succeed(`Fetched ${result.models.length} model(s) from ${provider}.`);
+    return result.models;
+  }
+  spinner.fail(`Could not fetch models: ${result.error}`);
+  return null;
+}
+
+/**
+ * Interactive model picker. Prefers the live cache; warns (and stays usable) when
+ * it falls back to the hardcoded seed; always offers a live refresh and a manual
+ * model-id entry. Returns the chosen model id, or null if cancelled/empty.
+ */
+async function selectModel(provider: LLMProvider): Promise<string | null> {
+  let { models, fromFallback } = getModels(provider);
+
+  if (fromFallback && supportsDiscovery(provider)) {
+    showWarning(
+      `Showing a hardcoded fallback list for ${provider} — NOT recommended. ` +
+      'Choose "Refresh" to load the live catalog from the server.',
+    );
+  }
+
+  const REFRESH = '__refresh__';
+  const MANUAL = '__manual__';
+
+  // Loop so a Refresh re-renders the picker with the freshly-fetched choices.
+  for (;;) {
+    const choices = [
+      { name: '↻ Refresh models from server', value: REFRESH },
+      ...models.map(m => ({
+        name: `${m.name} (${m.id})${m.contextWindow ? ` — ${m.contextWindow.toLocaleString()} ctx` : ''}`,
+        value: m.id,
+      })),
+      { name: '✎ Enter model ID manually', value: MANUAL },
+    ];
+
+    const { selected } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'selected',
+        message: fromFallback ? 'Select model (fallback list):' : 'Select model:',
+        choices,
+        default: config.get('defaultModel'),
+        pageSize: 15,
+      },
+    ]);
+
+    if (selected === REFRESH) {
+      const live = await refreshModelsInteractive(provider);
+      if (live && live.length) { models = live; fromFallback = false; }
+      continue;
+    }
+    if (selected === MANUAL) {
+      const { manualId } = await inquirer.prompt([
+        { type: 'input', name: 'manualId', message: 'Model ID:' },
+      ]);
+      const id = (manualId as string | undefined)?.trim();
+      return id || null;
+    }
+    return selected;
+  }
+}
+
+/** Prompt for one of the endpoint-owning providers. */
+async function pickEndpointProvider(message: string): Promise<ApiKeyProvider> {
+  const { provider } = await inquirer.prompt([
+    { type: 'list', name: 'provider', message, choices: ENDPOINT_PROVIDERS },
+  ]);
+  return provider;
+}
+
 async function openSettings(): Promise<void> {
   const { setting } = await inquirer.prompt([
     {
@@ -507,29 +600,35 @@ async function openSettings(): Promise<void> {
         { name: 'Change default provider', value: 'provider' },
         { name: 'Change default model', value: 'model' },
         { name: 'Add/update API key', value: 'apikey' },
+        { name: 'Set base URL (point at a local/self-hosted endpoint)', value: 'baseurl' },
+        { name: '↻ Refresh model list from server', value: 'refresh' },
         { name: 'Back', value: 'back' },
       ],
     },
   ]);
 
   switch (setting) {
-    case 'view':
+    case 'view': {
       const settings = config.getAll();
       console.log('');
       console.log(chalk.bold('Current Configuration:'));
       console.log(chalk.cyan('  Provider:'), settings.defaultProvider);
       console.log(chalk.cyan('  Model:'), settings.defaultModel);
-      console.log(chalk.cyan('  OpenRouter:'), hasApiKey('openrouter') ? chalk.green('configured') : chalk.red('not set'));
-      console.log(chalk.cyan('  Venice:'), hasApiKey('venice') ? chalk.green('configured') : chalk.red('not set'));
-      console.log(chalk.cyan('  Anthropic:'), hasApiKey('anthropic') ? chalk.green('configured') : chalk.red('not set'));
-      console.log(chalk.cyan('  OpenAI:'), hasApiKey('openai') ? chalk.green('configured') : chalk.red('not set'));
+      for (const p of ENDPOINT_PROVIDERS) {
+        const keyState = p === 'custom' && !hasApiKey('custom')
+          ? chalk.gray('keyless/optional')
+          : hasApiKey(p) ? chalk.green('configured') : chalk.red('not set');
+        const baseUrl = config.get(p).baseUrl || chalk.gray('(unset)');
+        console.log(`  ${chalk.cyan(p.padEnd(11))} key: ${keyState}  ${chalk.gray('url:')} ${baseUrl}`);
+      }
       console.log('');
       break;
+    }
 
-    case 'provider':
+    case 'provider': {
       const providers = getConfiguredProviders().filter(p => p !== 'mock' && p !== 'local');
       if (providers.length === 0) {
-        showWarning('No API keys configured');
+        showWarning('No providers configured — add an API key or set a custom base URL first.');
         break;
       }
       const { provider } = await inquirer.prompt([
@@ -544,53 +643,71 @@ async function openSettings(): Promise<void> {
       config.setDefaultProvider(provider);
       showSuccess(`Default provider set to: ${provider}`);
       break;
+    }
 
     case 'model': {
       const currentProvider = config.get('defaultProvider');
-      const availableModels = AVAILABLE_MODELS[currentProvider];
-      if (!availableModels || availableModels.length === 0) {
-        showWarning(`No models available for ${currentProvider}`);
+      const selectedModel = await selectModel(currentProvider);
+      if (!selectedModel) {
+        showWarning('No model selected.');
         break;
       }
-      const { selectedModel } = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'selectedModel',
-          message: 'Select default model:',
-          choices: availableModels.map(m => ({
-            name: `${m.name} (${m.id}) - ${m.contextWindow.toLocaleString()} ctx`,
-            value: m.id,
-          })),
-          default: config.get('defaultModel'),
-        },
-      ]);
       config.setDefaultModel(currentProvider, selectedModel);
       showSuccess(`Default model set to: ${selectedModel}`);
       break;
     }
 
-    case 'apikey':
-      const { keyProvider } = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'keyProvider',
-          message: 'Which provider?',
-          choices: ['openrouter', 'venice', 'anthropic', 'openai'],
-        },
-      ]);
+    case 'apikey': {
+      const keyProvider = await pickEndpointProvider('Which provider?');
+      const optional = keyProvider === 'custom';
       const { apiKey } = await inquirer.prompt([
         {
           type: 'password',
           name: 'apiKey',
-          message: `Enter ${keyProvider} API key:`,
+          message: `Enter ${keyProvider} API key${optional ? ' (leave blank for keyless local server)' : ''}:`,
           mask: '*',
         },
       ]);
       if (apiKey) {
         setApiKey(keyProvider, apiKey);
         showSuccess(`${keyProvider} API key saved!`);
+      } else if (!optional) {
+        showWarning('No key entered.');
+        break;
       }
+      // Inline validate → fetch: confirm the endpoint answers and cache its catalog.
+      await refreshModelsInteractive(keyProvider);
       break;
+    }
+
+    case 'baseurl': {
+      const provider = await pickEndpointProvider('Set base URL for which provider?');
+      const current = config.get(provider).baseUrl;
+      const { url } = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'url',
+          message: `Base URL for ${provider} (OpenAI-compatible, include /v1):`,
+          default: current || (provider === 'custom' ? 'http://localhost:8080/v1' : undefined),
+        },
+      ]);
+      const trimmed = (url as string | undefined)?.trim();
+      if (!trimmed) {
+        showWarning('No base URL entered.');
+        break;
+      }
+      setBaseUrl(provider, trimmed);
+      showSuccess(`${provider} base URL set to: ${trimmed}`);
+      // Inline validate → fetch against the new endpoint.
+      await refreshModelsInteractive(provider);
+      break;
+    }
+
+    case 'refresh': {
+      const provider = await pickEndpointProvider('Refresh models for which provider?');
+      await refreshModelsInteractive(provider);
+      break;
+    }
   }
 }
 
@@ -642,6 +759,8 @@ program
       [chalk.cyan('Venice API Key'), hasApiKey('venice') ? chalk.green('✓ Configured') : chalk.red('✗ Not set')],
       [chalk.cyan('Anthropic API Key'), hasApiKey('anthropic') ? chalk.green('✓ Configured') : chalk.red('✗ Not set')],
       [chalk.cyan('OpenAI API Key'), hasApiKey('openai') ? chalk.green('✓ Configured') : chalk.red('✗ Not set')],
+      [chalk.cyan('NVIDIA API Key'), hasApiKey('nvidia') ? chalk.green('✓ Configured') : chalk.red('✗ Not set')],
+      [chalk.cyan('Custom Base URL'), settings.custom.baseUrl ? chalk.green(settings.custom.baseUrl) : chalk.red('✗ Not set')],
       [chalk.cyan('Config Path'), config.getConfigPath()],
     );
 
@@ -681,14 +800,34 @@ program
 
 program
   .command('models')
-  .description('List available models')
-  .action(() => {
+  .description('List available models (live from the provider, with --refresh)')
+  .option('-p, --provider <provider>', 'provider to list (defaults to the configured one)')
+  .option('-r, --refresh', 'fetch the live catalog from the server instead of the cache')
+  .action(async (opts: { provider?: string; refresh?: boolean }) => {
     showBanner();
 
-    const provider = config.get('defaultProvider');
-    const models = AVAILABLE_MODELS[provider];
+    const provider = (opts.provider as LLMProvider) || config.get('defaultProvider');
 
-    console.log(chalk.bold(`Available models for ${provider}:\n`));
+    let models: ModelInfo[];
+    let fromFallback = false;
+    if (opts.refresh) {
+      const live = await refreshModelsInteractive(provider);
+      models = live ?? getModels(provider).models;
+      fromFallback = live === null;
+    } else {
+      ({ models, fromFallback } = getModels(provider));
+    }
+
+    if (fromFallback && supportsDiscovery(provider)) {
+      showWarning(`Hardcoded fallback list for ${provider} — NOT recommended. Re-run with --refresh for the live catalog.`);
+    }
+
+    console.log(chalk.bold(`\nModels for ${provider}${fromFallback ? ' (fallback)' : ''}:\n`));
+
+    if (models.length === 0) {
+      showInfo('No models to show. Configure the endpoint/key and run with --refresh.');
+      return;
+    }
 
     const table = new Table({
       head: [chalk.cyan('Model ID'), chalk.cyan('Name'), chalk.cyan('Context')],
@@ -699,12 +838,42 @@ program
       table.push([
         model.id,
         model.name,
-        `${model.contextWindow.toLocaleString()} tokens`,
+        model.contextWindow ? `${model.contextWindow.toLocaleString()} tokens` : chalk.gray('—'),
       ]);
     }
 
     console.log(table.toString());
     console.log('');
+  });
+
+program
+  .command('refresh-models')
+  .description('Fetch and cache the live model catalog for a provider')
+  .option('-p, --provider <provider>', 'provider (defaults to the configured one)')
+  .action(async (opts: { provider?: string }) => {
+    const provider = (opts.provider as LLMProvider) || config.get('defaultProvider');
+    const models = await refreshModelsInteractive(provider);
+    process.exit(models ? 0 : 1);
+  });
+
+program
+  .command('validate')
+  .description('Validate a provider endpoint/key by hitting its /models route')
+  .argument('[provider]', 'provider to validate (defaults to the configured one)')
+  .action(async (providerArg?: string) => {
+    const provider = (providerArg as LLMProvider) || config.get('defaultProvider');
+    if (!supportsDiscovery(provider)) {
+      showWarning(`${provider} has no discoverable model catalog to validate against.`);
+      process.exit(0);
+    }
+    const spinner = ora(`Validating ${provider}…`).start();
+    const result = await refreshModels(provider);
+    if (result.ok) {
+      spinner.succeed(`${provider} OK — ${result.models.length} model(s) reachable.`);
+      process.exit(0);
+    }
+    spinner.fail(`${provider} validation failed: ${result.error}`);
+    process.exit(1);
   });
 
 // Run CLI

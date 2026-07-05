@@ -5404,6 +5404,35 @@
                             <div style="font-size: 10px; color: #888; margin-bottom: 8px;">Stored, but direct-LLM currently routes via <b>OpenRouter</b> or a connected agent — not wired to this key yet.</div>
                             <button class="btn btn-primary btn-sm" onclick="saveApiKey('openai')">Save</button>
                         </div>
+
+                        <div class="card">
+                            <h4 style="margin-bottom: 12px; font-size: 14px;">NVIDIA API Key</h4>
+                            <div class="form-group">
+                                <div class="api-key-input">
+                                    <input type="password" class="form-input" id="nvidiaKey" placeholder="nvapi-...">
+                                    <button class="api-key-toggle" onclick="toggleApiKey('nvidiaKey')">Show</button>
+                                </div>
+                                <div class="form-hint">NVIDIA NIM (OpenAI-compatible). Get key from <a href="https://build.nvidia.com/" target="_blank" style="color: var(--accent);">build.nvidia.com</a></div>
+                            </div>
+                            <button class="btn btn-primary btn-sm" onclick="saveApiKey('nvidia')">Save</button>
+                        </div>
+
+                        <div class="card" style="border: 1px solid rgba(0,200,255,0.25);">
+                            <h4 style="margin-bottom: 12px; font-size: 14px;">🖧 Custom / Local Server <span style="font-size:10px; color:#2fd6ff; font-weight:600;">OpenAI-compatible</span></h4>
+                            <div class="form-group">
+                                <label style="font-size:11px; color:#8a99a5; display:block; margin-bottom:4px;">Base URL</label>
+                                <input type="text" class="form-input" id="customBaseUrl" placeholder="http://localhost:8080/v1">
+                                <div class="form-hint">Point at vLLM / llama.cpp / LM Studio / Ollama's OpenAI shim. Include <code>/v1</code>.</div>
+                            </div>
+                            <div class="form-group">
+                                <label style="font-size:11px; color:#8a99a5; display:block; margin-bottom:4px;">API Key <span style="color:#5f7079;">(optional — leave blank for keyless servers)</span></label>
+                                <div class="api-key-input">
+                                    <input type="password" class="form-input" id="customKey" placeholder="(optional)">
+                                    <button class="api-key-toggle" onclick="toggleApiKey('customKey')">Show</button>
+                                </div>
+                            </div>
+                            <button class="btn btn-primary btn-sm" onclick="saveCustomProvider()">Save & Test</button>
+                        </div>
                     </div>
 
                     <div class="settings-section">
@@ -5430,9 +5459,25 @@
 
                     <div class="settings-section">
                         <h2 class="settings-title">🤖 Model Selection</h2>
-                        <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">Select your preferred AI model for agent operations</p>
+                        <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">Pick a provider, then choose a model from its <b>live</b> catalog. The list is fetched from the provider's own <code>/models</code> endpoint.</p>
+                        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
+                            <select id="modelProviderSelect" onchange="onModelProviderChange()" style="padding:8px 12px; background:rgba(0,0,0,0.3); border:1px solid #444; border-radius:6px; color:#fff; font-size:12px;">
+                                <option value="openrouter">OpenRouter</option>
+                                <option value="venice">Venice</option>
+                                <option value="anthropic">Anthropic</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="nvidia">NVIDIA</option>
+                                <option value="custom">Custom / Local</option>
+                            </select>
+                            <button class="btn btn-sm" onclick="refreshLiveModels()" style="background:rgba(0,200,255,0.15); border:1px solid rgba(0,200,255,0.35); color:#bcd;">↻ Refresh models</button>
+                            <span id="modelListStatus" style="font-size:11px; color:#7f90a0;"></span>
+                        </div>
                         <div class="model-selector" id="modelSelector">
                             <div style="color: var(--text-muted); padding: 20px; text-align: center;">Loading models...</div>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+                            <input type="text" id="manualModelInput" placeholder="…or type a model ID manually" style="flex:1; padding:8px 12px; background:rgba(0,0,0,0.3); border:1px solid #444; border-radius:6px; color:#fff; font-size:12px; font-family:'JetBrains Mono',monospace;">
+                            <button class="btn btn-sm" onclick="useManualModel()" style="background:rgba(255,255,255,0.06); border:1px solid #444;">Use</button>
                         </div>
                         <div style="margin-top: 16px; padding: 12px; background: rgba(255,136,0,0.08); border-radius: 8px; border: 1px solid rgba(255,136,0,0.25);">
                             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
@@ -6157,7 +6202,7 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
             /**
              * Start a mission via the backend
              */
-            async startMission(missionName, targets, operators, apiKey, provider, model, approvalId) {
+            async startMission(missionName, targets, operators, apiKey, provider, model, approvalId, baseUrl) {
                 const result = await T3MP3ST_API.post('/api/mission/start', {
                     name: missionName,
                     targets: targets.map(t => ({ host: t.host || t })),
@@ -6165,6 +6210,7 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
                     apiKey,
                     provider,
                     model,
+                    ...(baseUrl ? { baseUrl } : {}),
                     ...(approvalId ? { approvalId } : {}),
                 });
                 if (result.success) {
@@ -6890,6 +6936,14 @@ Correlating findings across agents, identifying patterns, producing actionable i
             if (veKey) veKey.value = state.settings.veniceKey || '';
             if (anKey) anKey.value = state.settings.anthropicKey || '';
             if (oaKey) oaKey.value = state.settings.openaiKey || '';
+            const nvKey = document.getElementById('nvidiaKey');
+            const cuKey = document.getElementById('customKey');
+            const cuUrl = document.getElementById('customBaseUrl');
+            if (nvKey) nvKey.value = state.settings.nvidiaKey || '';
+            if (cuKey) cuKey.value = state.settings.customKey || '';
+            if (cuUrl) cuUrl.value = state.settings.customBaseUrl || '';
+            const provSel = document.getElementById('modelProviderSelect');
+            if (provSel) provSel.value = state.settings.modelProvider || 'openrouter';
         }
 
         function saveState() {
@@ -8281,30 +8335,118 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
             toast(`${provider} key saved`, 'success');
         }
 
+        // Currently selected model provider (drives the live model list).
+        function currentModelProvider() {
+            return (document.getElementById('modelProviderSelect')?.value) || state.settings.modelProvider || 'openrouter';
+        }
+
+        // Live model cache per provider: { [provider]: { models:[{id,name,provider}], fromFallback:bool } }
+        state.settings.liveModels = state.settings.liveModels || {};
+
+        // Models to show for a provider: live cache if present, else the hardcoded
+        // seed filtered to that provider (openrouter carries the full multi-vendor list).
+        function modelsForProvider(provider) {
+            const cached = state.settings.liveModels?.[provider];
+            if (cached && cached.models && cached.models.length) return { models: cached.models, fromFallback: false };
+            const seed = provider === 'openrouter'
+                ? MODELS
+                : MODELS.filter(m => (m.provider || '').toLowerCase() === provider.toLowerCase());
+            return { models: seed, fromFallback: true };
+        }
+
         function renderModels() {
             const container = document.getElementById('modelSelector');
-            if (!container) {
-                console.error('modelSelector element not found');
+            if (!container) return;
+            const provider = currentModelProvider();
+            const { models, fromFallback } = modelsForProvider(provider);
+            const statusEl = document.getElementById('modelListStatus');
+            if (statusEl) {
+                statusEl.textContent = models.length
+                    ? (fromFallback ? '⚠ hardcoded fallback — click Refresh for the live catalog' : `✓ ${models.length} live model(s)`)
+                    : 'no models — set the key/base URL, then Refresh';
+                statusEl.style.color = fromFallback ? '#d9a441' : '#4fd18b';
+            }
+            if (!models.length) {
+                container.innerHTML = '<div style="color: var(--text-muted); padding:16px; text-align:center;">No models. Configure the provider then click <b>↻ Refresh models</b>, or type an ID below.</div>';
                 return;
             }
-            if (!MODELS || MODELS.length === 0) {
-                container.innerHTML = '<div style="color: var(--error);">No models available</div>';
-                return;
-            }
-            const selectedModel = state.settings?.selectedModel || 'anthropic/claude-opus-4.6';
-            container.innerHTML = MODELS.map(m => `
-                <div class="model-option ${selectedModel === m.id ? 'selected' : ''}" onclick="selectModel('${m.id}')">
-                    <h4>${m.name}</h4>
-                    <p>${m.provider}</p>
+            const selectedModel = state.settings?.selectedModel || '';
+            container.innerHTML = models.map(m => `
+                <div class="model-option ${selectedModel === m.id ? 'selected' : ''}" onclick="selectModel('${String(m.id).replace(/'/g, "\\'")}')">
+                    <h4>${m.name || m.id}</h4>
+                    <p>${m.provider || provider}${m.contextWindow ? ' · ' + Number(m.contextWindow).toLocaleString() + ' ctx' : ''}</p>
                 </div>
             `).join('');
         }
 
         function selectModel(id) {
             state.settings.selectedModel = id;
+            state.settings.modelProvider = currentModelProvider();
             saveState();
             renderModels();
-            toast(`Selected ${MODELS.find(m => m.id === id).name}`, 'success');
+            toast(`Selected ${id}`, 'success');
+        }
+
+        function onModelProviderChange() {
+            state.settings.modelProvider = currentModelProvider();
+            saveState();
+            renderModels();
+        }
+
+        function useManualModel() {
+            const el = document.getElementById('manualModelInput');
+            const id = (el?.value || '').trim();
+            if (!id) { toast('Enter a model ID', 'error'); return; }
+            selectModel(id);
+        }
+
+        // Fetch the live catalog from the server-side discovery endpoint (same /models
+        // fetch the CLI uses). Sends the provider's stored key + base URL per-call.
+        async function refreshLiveModels() {
+            const provider = currentModelProvider();
+            const base = (typeof T3MP3ST_API !== 'undefined' && T3MP3ST_API.baseUrl) || '';
+            const statusEl = document.getElementById('modelListStatus');
+            if (statusEl) { statusEl.textContent = 'fetching…'; statusEl.style.color = '#7f90a0'; }
+            try {
+                const res = await fetch(`${base}/api/models`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        provider,
+                        baseUrl: provider === 'custom' ? (state.settings.customBaseUrl || '') : '',
+                        apiKey: state.settings[`${provider}Key`] || '',
+                    }),
+                });
+                const data = await res.json();
+                if (data.ok && Array.isArray(data.models)) {
+                    state.settings.liveModels[provider] = { models: data.models, fromFallback: false };
+                    saveState();
+                    renderModels();
+                    toast(`Fetched ${data.models.length} model(s) from ${provider}`, 'success');
+                } else {
+                    renderModels();
+                    toast(`Could not fetch models: ${data.error || 'unknown error'}`, 'error');
+                }
+            } catch (e) {
+                renderModels();
+                toast(`Model fetch failed: ${e.message || e}`, 'error');
+            }
+        }
+
+        // Save the custom/local server (base URL + optional key), then validate + list.
+        function saveCustomProvider() {
+            const url = (document.getElementById('customBaseUrl')?.value || '').trim();
+            const key = (document.getElementById('customKey')?.value || '').trim();
+            if (!url) { toast('Enter a base URL', 'error'); return; }
+            state.settings.customBaseUrl = url;
+            state.settings.customKey = key;
+            saveState();
+            toast('Custom server saved — testing…', 'success');
+            // Switch the model picker to custom and fetch its catalog.
+            const provSel = document.getElementById('modelProviderSelect');
+            if (provSel) provSel.value = 'custom';
+            state.settings.modelProvider = 'custom';
+            refreshLiveModels();
         }
 
         function saveFallbackModel() {
@@ -10225,8 +10367,9 @@ Bypass all protections:
         }
 
         function getApiKey() {
-            // Check multiple possible locations for API key
-            return state.settings?.openrouterKey || state.apiKey || '';
+            // Key for the SELECTED provider (falls back to openrouter for legacy callers).
+            const provider = state.settings?.modelProvider || 'openrouter';
+            return state.settings?.[`${provider}Key`] || state.settings?.openrouterKey || state.apiKey || '';
         }
 
         // Shared safe LLM call — handles response.ok, JSON parsing, timeouts, model fallback
@@ -10272,6 +10415,36 @@ Bypass all protections:
         async function _safeLLMCallOnce(apiKey, prompt, model, options = {}) {
             if (typeof trackApiCall === 'function') trackApiCall();
             addIntel('API', `→ ${model}`, 'info');
+            const cfg = llmRequestConfig();
+            const base = (typeof T3MP3ST_API !== 'undefined' && T3MP3ST_API.baseUrl) || '';
+
+            // Backend connected → route through the server so the SELECTED provider is
+            // honored (incl. custom/local, which the browser can't call directly due to
+            // CORS). Falls back to a direct call only in standalone (no-backend) mode.
+            if (base && T3MP3ST_API.connected) {
+                const messages = Array.isArray(prompt) ? prompt : [{ role: 'user', content: prompt }];
+                const sys = messages.find(m => m.role === 'system')?.content;
+                const userMsg = messages.filter(m => m.role !== 'system').map(m => m.content).join('\n\n');
+                const resp = await fetch(`${base}/api/llm/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: userMsg, systemPrompt: sys,
+                        provider: cfg.provider, model: model || cfg.model,
+                        apiKey: cfg.apiKey, baseUrl: cfg.baseUrl,
+                    }),
+                    signal: AbortSignal.timeout(options.timeout || 120000)
+                });
+                if (!resp.ok) {
+                    const t = await resp.text().catch(() => '');
+                    throw new Error(`API ${resp.status}: ${t.substring(0, 200)}`);
+                }
+                const data = await resp.json();
+                return data.response || '';
+            }
+
+            // Standalone (no backend) — direct OpenAI-compatible call. Works for
+            // browser-reachable, CORS-friendly providers (openrouter/openai/etc).
             const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
                 method: 'POST',
                 headers: {
@@ -15718,15 +15891,33 @@ ACTION_INPUT: {"output":"Found confirmed SQLi on /login endpoint..."}`;
 
         let generalPlanData = null;
 
+        // Per-provider stored key (custom's key is optional/keyless).
+        function getProviderKey(provider) {
+            return state.settings?.[`${provider}Key`] || '';
+        }
+
+        // Canonical LLM request config — the SELECTED provider drives everything, so
+        // mission/admiral/chat calls route to it (incl. custom/local + nvidia), not a
+        // hardcoded openrouter. baseUrl is sent for custom so the server hits your box.
+        function llmRequestConfig() {
+            const provider = state.settings?.modelProvider
+                || localStorage.getItem('t3mp3st_general_provider')
+                || (T3MP3ST_API?.connected ? 'codex' : 'openrouter');
+            const apiKey = getProviderKey(provider);
+            const model = provider === 'codex'
+                ? 'codex-default'
+                : (state.settings?.selectedModel || 'anthropic/claude-sonnet-4');
+            const baseUrl = provider === 'custom' ? (state.settings?.customBaseUrl || '') : '';
+            return { provider, apiKey, model, baseUrl };
+        }
+
         function getGeneralConfig() {
-            const apiKey = getApiKey();
-            const provider = localStorage.getItem('t3mp3st_general_provider') || (T3MP3ST_API?.connected ? 'codex' : 'openrouter');
-            const model = provider === 'codex' ? 'codex-default' : (state.settings?.selectedModel || 'anthropic/claude-sonnet-4');
-            return { apiKey, provider, model };
+            return llmRequestConfig();
         }
 
         function _generalNeedsApiKey(provider) {
-            return !['codex', 'mock', 'local'].includes(provider);
+            // custom = local/self-hosted server, key optional (keyless allowed).
+            return !['codex', 'mock', 'local', 'custom'].includes(provider);
         }
 
         function _generalCodexRequiresBackend(provider) {
@@ -16200,7 +16391,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
             const directive = document.getElementById('generalDirective')?.value?.trim();
             if (!directive) { toast('Enter a directive for the Admiral', 'error'); return; }
 
-            const { apiKey, provider, model } = getGeneralConfig();
+            const { apiKey, provider, model, baseUrl } = getGeneralConfig();
             if (_generalNeedsApiKey(provider) && !apiKey) { toast('API key required — configure in Settings', 'error'); return; }
             if (_generalCodexRequiresBackend(provider)) { toast('Codex mode needs the local T3MP3ST backend', 'warning'); return; }
 
@@ -16232,7 +16423,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             objective: directive, constraints, scopeHints, urgency, opsecPreference,
-                            apiKey, provider, model,
+                            apiKey, provider, model, baseUrl,
                         }),
                     });
 
@@ -16698,7 +16889,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
         async function generalExecutePlan() {
             if (!generalPlanData) { toast('No plan to execute — plan first', 'error'); return; }
 
-            const { apiKey, provider, model } = getGeneralConfig();
+            const { apiKey, provider, model, baseUrl } = getGeneralConfig();
             // Keyless: the server falls back to its configured LLM / connected agent, so only block
             // when there's neither a client key NOR a backend (matches the hunt/engage/mission paths).
             const hasBackend = (typeof window.t3mpHasBackend === 'function' && window.t3mpHasBackend());
@@ -16761,7 +16952,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                     const resp = await fetch(`${getApiBase()}/api/general/execute`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ apiKey, provider, model }),
+                        body: JSON.stringify({ apiKey, provider, model, baseUrl }),
                     });
 
                     const data = await resp.json();
@@ -16810,7 +17001,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
             const directive = document.getElementById('generalDirective')?.value?.trim();
             if (!directive) { toast('Enter a directive for the Admiral', 'error'); return; }
 
-            const { apiKey, provider, model } = getGeneralConfig();
+            const { apiKey, provider, model, baseUrl } = getGeneralConfig();
             if (_generalNeedsApiKey(provider) && !apiKey) { toast('API key required — configure in Settings', 'error'); return; }
             if (_generalCodexRequiresBackend(provider)) { toast('Codex mode needs the local T3MP3ST backend', 'warning'); return; }
 
@@ -16845,7 +17036,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 objective: directive, constraints, scopeHints, urgency, opsecPreference,
-                                apiKey, provider, model,
+                                apiKey, provider, model, baseUrl,
                             }),
                         });
 
@@ -18170,20 +18361,23 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                 // Determine the LLM backend. Priority: a configured API key → its provider; else a
                 // connected local agent (Claude Code / Codex / Hermes) which needs NO key (uses its own
                 // login); else fall through to the server's own configured LLM.
-                let provider = 'openrouter';
-                let model = state.settings.selectedModel || 'anthropic/claude-sonnet-4';
-                const agentBackend = (!apiKey && typeof window.t3mpPreferredAgent === 'function') ? window.t3mpPreferredAgent() : null;
-                if (!apiKey && agentBackend) {
+                // The provider SELECTED in Settings → Model drives routing (custom/local,
+                // nvidia, anthropic, openai, …). A connected local agent still wins ONLY
+                // when there's no key AND no explicit non-openrouter selection.
+                const _req = llmRequestConfig();
+                let provider = _req.provider;
+                let model = _req.model;
+                let baseUrl = _req.baseUrl;
+                const agentBackend = (!apiKey && provider !== 'custom' && typeof window.t3mpPreferredAgent === 'function') ? window.t3mpPreferredAgent() : null;
+                if (!apiKey && agentBackend && !state.settings?.modelProvider) {
                     provider = 'local-agent';
                     model = agentBackend; // the agent id (codex|claude|hermes) travels in `model`
                     addIntel('BACKEND', `No API key — routing the mission through your connected agent: ${agentBackend.toUpperCase()}`, 'success');
                     addMissionLog('info', `LLM backend: local agent (${agentBackend}) — no API key needed`);
-                } else if (apiKey && apiKey.startsWith('sk-ant-')) {
-                    provider = 'anthropic';
+                } else if (provider === 'anthropic') {
                     model = model.replace('anthropic/', ''); // Anthropic API doesn't use prefix
-                } else if (apiKey && apiKey.startsWith('sk-') && !apiKey.startsWith('sk-ant-')) {
-                    provider = 'openai';
                 }
+                addMissionLog('info', `LLM backend: ${provider}${model ? ' / ' + model : ''}${baseUrl ? ' @ ' + baseUrl : ''}`);
 
                 try {
                     let result = await BackendDispatch.startMission(
@@ -18193,7 +18387,8 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                         apiKey,
                         provider,
                         model,
-                        state.approvalId
+                        state.approvalId,
+                        baseUrl
                     );
 
                     // The backend gates active execution behind an approval receipt. Auto-grant it
@@ -18209,7 +18404,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                             await T3MP3ST_API.post(`/api/approvals/${result.approval.id}/approve`, {});
                             state.approvalId = result.approval.id;
                             result = await BackendDispatch.startMission(
-                                missionName, state.targets, state.operators, apiKey, provider, model, result.approval.id
+                                missionName, state.targets, state.operators, apiKey, provider, model, result.approval.id, baseUrl
                             );
                         } else {
                             // Don't dead-end on a prose error — offer a one-click, explicit approval,
@@ -18226,7 +18421,7 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
                             await T3MP3ST_API.post(`/api/approvals/${result.approval.id}/approve`, {});
                             state.approvalId = result.approval.id;
                             result = await BackendDispatch.startMission(
-                                missionName, state.targets, state.operators, apiKey, provider, model, result.approval.id
+                                missionName, state.targets, state.operators, apiKey, provider, model, result.approval.id, baseUrl
                             );
                         }
                     }

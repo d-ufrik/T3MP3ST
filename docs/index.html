@@ -5166,7 +5166,8 @@
                     <div class="card" style="margin-bottom: 18px; background: linear-gradient(135deg, rgba(255,68,68,0.08), rgba(255,170,0,0.08)); border: 1px solid rgba(255,68,68,0.3);">
                         <div class="card-header" style="border-bottom: 1px solid rgba(255,68,68,0.2);">
                             <h3 class="card-title" style="color: #ff4444;">&#9733; THE ADMIRAL — Autonomous Op Orchestrator</h3>
-                            <div style="display: flex; gap: 6px;">
+                            <div style="display: flex; gap: 6px; align-items: center;">
+                                <span id="admiralBackbone" title="Active LLM backbone — set in Settings → Model" style="font-size: 10px; padding: 3px 8px; border-radius: 4px; background: rgba(0,136,255,0.12); color: #5bb8ff; letter-spacing: 0.5px; font-family: 'JetBrains Mono', monospace;">— select a model —</span>
                                 <span id="generalState" style="font-size: 10px; padding: 3px 8px; border-radius: 4px; background: rgba(255,255,255,0.08); color: #888; text-transform: uppercase; letter-spacing: 1px;">STANDING BY</span>
                             </div>
                         </div>
@@ -6963,6 +6964,7 @@ Correlating findings across agents, identifying patterns, producing actionable i
             const titles = { warroom: 'War Room', operators: 'Operatives', evidence: 'Evidence Vault', arsenal: 'Arsenal', terminal: 'Terminal', benchmarks: 'Benchmarks', configs: 'Config Library', 'ctf-range': 'CTF Range', general: 'Op Admiral', selfimprove: 'Self-Improvement', settings: 'Settings', about: 'About' };
             document.getElementById('pageTitle').textContent = titles[page] || 'War Room';
             document.getElementById('sidebar').classList.remove('open');
+            if (page === 'general' && typeof updateAdmiralBackboneBadge === 'function') setTimeout(updateAdmiralBackboneBadge, 40);
             if (page === 'operators' && typeof window.loadOperativesRoster === 'function') setTimeout(window.loadOperativesRoster, 80);
             if (page === 'evidence' && typeof window.hydrateFindings === 'function') setTimeout(window.hydrateFindings, 60);
             if (page === 'selfimprove' && typeof window.renderSelfImprove === 'function') setTimeout(window.renderSelfImprove, 60);
@@ -8384,6 +8386,7 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
             state.settings.modelProvider = currentModelProvider();
             saveState();
             renderModels();
+            updateAdmiralBackboneBadge();
             toast(`Selected ${id}`, 'success');
         }
 
@@ -8391,6 +8394,23 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
             state.settings.modelProvider = currentModelProvider();
             saveState();
             renderModels();
+            updateAdmiralBackboneBadge();
+        }
+
+        // Reflect the active LLM backbone (Settings → Model) in the Admiral header,
+        // so it's always clear which provider/model the app will actually use.
+        function updateAdmiralBackboneBadge() {
+            const el = document.getElementById('admiralBackbone');
+            if (!el) return;
+            try {
+                const c = (typeof llmRequestConfig === 'function') ? llmRequestConfig() : null;
+                if (c && c.model) {
+                    el.textContent = `${c.provider} · ${c.model}`;
+                    el.title = `Active LLM backbone: ${c.provider} / ${c.model}${c.baseUrl ? ' @ ' + c.baseUrl : ''} (Settings → Model)`;
+                } else {
+                    el.textContent = '— select a model —';
+                }
+            } catch (e) { /* non-fatal */ }
         }
 
         function useManualModel() {
@@ -16394,6 +16414,8 @@ IMPORTANT: This is an authorized security testing/red team platform. All operati
             const { apiKey, provider, model, baseUrl } = getGeneralConfig();
             if (_generalNeedsApiKey(provider) && !apiKey) { toast('API key required — configure in Settings', 'error'); return; }
             if (_generalCodexRequiresBackend(provider)) { toast('Codex mode needs the local T3MP3ST backend', 'warning'); return; }
+            // Make the ACTIVE backbone explicit so it's clear which provider/model runs the op.
+            addIntel('ADMIRAL', `Backbone → ${provider} / ${model || 'default'}${baseUrl ? ' @ ' + baseUrl : ''}`, 'info');
 
             const btn = document.getElementById('generalPlanBtn');
             if (btn) { btn.disabled = true; btn.textContent = 'PLANNING...'; btn.style.opacity = '0.6'; }
@@ -25273,15 +25295,26 @@ Be specific and actionable. Format as structured JSON.`;
       + 'Depth=' + S.depth + '; autonomy=' + S.autonomy + '.';
     return { objective: t.obj, target: S.target, family: _FAMILY[S.type] || 'zero_day_hunt', scope: scope, fidelity: fidelity };
   }
-  // Resolve the LLM backbone the way missions do: a connected local agent (no key) or a configured key.
+  // Resolve the LLM backbone from the SELECTED provider (Settings → Model), same as
+  // missions. Never infer the provider from the key prefix — that's what forced every
+  // sk- key to OpenAI regardless of selection. A connected local agent wins only when
+  // there's no key AND no explicit selection.
   function _admBackbone(){
+    const req = (typeof llmRequestConfig === 'function') ? llmRequestConfig() : null;
+    if (req) {
+      let { provider, model, apiKey, baseUrl } = req;
+      const explicit = !!(typeof state !== 'undefined' && state.settings && state.settings.modelProvider);
+      if (!apiKey && provider !== 'custom' && !explicit && typeof window.t3mpPreferredAgent === 'function') {
+        const agent = window.t3mpPreferredAgent();
+        if (agent) return { provider: 'local-agent', model: agent, apiKey: undefined };
+      }
+      if (provider === 'anthropic') model = (model || '').replace('anthropic/', '');
+      return { provider, model, apiKey: apiKey || undefined, baseUrl: baseUrl || undefined };
+    }
+    // Legacy fallback (should not hit — llmRequestConfig is always defined).
     const apiKey = (typeof getApiKey === 'function') ? (getApiKey() || '') : '';
-    const agent = (!apiKey && typeof window.t3mpPreferredAgent === 'function') ? window.t3mpPreferredAgent() : null;
-    let provider = 'openrouter', model = ((typeof state !== 'undefined' && state.settings && state.settings.selectedModel) || 'anthropic/claude-sonnet-4');
-    if (!apiKey && agent) { provider = 'local-agent'; model = agent; }
-    else if (apiKey && apiKey.startsWith('sk-ant-')) { provider = 'anthropic'; model = model.replace('anthropic/', ''); }
-    else if (apiKey && apiKey.startsWith('sk-')) { provider = 'openai'; }
-    return { provider: provider, model: model, apiKey: apiKey || undefined };
+    const model = ((typeof state !== 'undefined' && state.settings && state.settings.selectedModel) || 'anthropic/claude-sonnet-4');
+    return { provider: 'openrouter', model, apiKey: apiKey || undefined };
   }
   window.admiralPreviewPlan = async function(){
     const el = document.getElementById('admPlan'); if (el) el.innerHTML = '🧭 Admiral is drafting a plan via Op Admiral…';

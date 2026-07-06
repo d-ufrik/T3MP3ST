@@ -6687,7 +6687,7 @@ app.post('/api/general/plan', async (req: Request, res: Response): Promise<void>
   }
 
   try {
-    const generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
+    const generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
     // Create a dedicated LLM backbone for the General
     const generalLLM = new LLMBackbone(generalConfig);
 
@@ -6757,7 +6757,7 @@ app.post('/api/general/execute', async (req: Request, res: Response): Promise<vo
 
   let generalConfig;
   try {
-    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
+    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
   } catch (error: any) {
     res.status(400).json({ error: error.message || 'API key required' });
     return;
@@ -6875,7 +6875,7 @@ app.post('/api/general/auto', async (req: Request, res: Response): Promise<void>
 
   let generalConfig;
   try {
-    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
+    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
   } catch (error: any) {
     res.status(400).json({ error: error.message || 'API key required' });
     return;
@@ -7134,7 +7134,7 @@ app.post('/api/admiral/converse', async (req: Request, res: Response): Promise<v
     if (llm) {
       admiralLLM = llm;
     } else {
-      const cfg = resolveGeneralLLMConfig(provider, model, apiKey);
+      const cfg = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
       admiralLLM = new LLMBackbone(cfg);
     }
     const admiral = new Admiral(admiralLLM);
@@ -7168,7 +7168,7 @@ app.post('/api/admiral/suggest', async (req: Request, res: Response): Promise<vo
     let admiralLLM: LLMBackbone;
     if (llm) { admiralLLM = llm; }
     else {
-      const cfg = resolveGeneralLLMConfig(provider, model, apiKey);
+      const cfg = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
       admiralLLM = new LLMBackbone(cfg);
     }
     const admiral = new Admiral(admiralLLM);
@@ -7205,7 +7205,7 @@ app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<voi
 
     let generalConfig;
     try {
-      generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
+      generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, (req.body as { baseUrl?: string }).baseUrl);
     } catch (error: any) {
       res.status(400).json({ error: error.message || 'API key required' });
       return;

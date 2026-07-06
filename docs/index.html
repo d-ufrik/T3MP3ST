@@ -5461,6 +5461,15 @@
                     <div class="settings-section">
                         <h2 class="settings-title">🤖 Model Selection</h2>
                         <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 12px;">Pick a provider, then choose a model from its <b>live</b> catalog. The list is fetched from the provider's own <code>/models</code> endpoint.</p>
+                        <!-- Active-model card: the backbone the whole app (missions, Admiral, chat) will use -->
+                        <div style="display:flex; align-items:center; gap:12px; padding:12px 16px; margin-bottom:14px; background:linear-gradient(135deg, rgba(0,200,255,0.08), rgba(160,90,255,0.05)); border:1px solid rgba(0,200,255,0.3); border-radius:10px;">
+                            <span style="font-size:20px;">🎯</span>
+                            <div style="min-width:0;">
+                                <div style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#7f90a0;">Active model</div>
+                                <div id="settingsActiveModel" style="font-size:14px; font-weight:700; color:#2fd6ff; font-family:'JetBrains Mono', monospace; word-break:break-all;">— none selected —</div>
+                                <div id="settingsActiveEndpoint" style="font-size:10.5px; color:#5f7079; font-family:'JetBrains Mono', monospace; word-break:break-all;"></div>
+                            </div>
+                        </div>
                         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
                             <select id="modelProviderSelect" onchange="onModelProviderChange()" style="padding:8px 12px; background:rgba(0,0,0,0.3); border:1px solid #444; border-radius:6px; color:#fff; font-size:12px;">
                                 <option value="openrouter">OpenRouter</option>
@@ -6964,7 +6973,7 @@ Correlating findings across agents, identifying patterns, producing actionable i
             const titles = { warroom: 'War Room', operators: 'Operatives', evidence: 'Evidence Vault', arsenal: 'Arsenal', terminal: 'Terminal', benchmarks: 'Benchmarks', configs: 'Config Library', 'ctf-range': 'CTF Range', general: 'Op Admiral', selfimprove: 'Self-Improvement', settings: 'Settings', about: 'About' };
             document.getElementById('pageTitle').textContent = titles[page] || 'War Room';
             document.getElementById('sidebar').classList.remove('open');
-            if (page === 'general' && typeof updateAdmiralBackboneBadge === 'function') setTimeout(updateAdmiralBackboneBadge, 40);
+            if ((page === 'general' || page === 'settings') && typeof updateAdmiralBackboneBadge === 'function') setTimeout(updateAdmiralBackboneBadge, 40);
             if (page === 'operators' && typeof window.loadOperativesRoster === 'function') setTimeout(window.loadOperativesRoster, 80);
             if (page === 'evidence' && typeof window.hydrateFindings === 'function') setTimeout(window.hydrateFindings, 60);
             if (page === 'selfimprove' && typeof window.renderSelfImprove === 'function') setTimeout(window.renderSelfImprove, 60);
@@ -8400,17 +8409,32 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
         // Reflect the active LLM backbone (Settings → Model) in the Admiral header,
         // so it's always clear which provider/model the app will actually use.
         function updateAdmiralBackboneBadge() {
+            let c = null;
+            try { c = (typeof llmRequestConfig === 'function') ? llmRequestConfig() : null; } catch (e) { /* non-fatal */ }
+
+            // Admiral header badge
             const el = document.getElementById('admiralBackbone');
-            if (!el) return;
-            try {
-                const c = (typeof llmRequestConfig === 'function') ? llmRequestConfig() : null;
+            if (el) {
                 if (c && c.model) {
                     el.textContent = `${c.provider} · ${c.model}`;
                     el.title = `Active LLM backbone: ${c.provider} / ${c.model}${c.baseUrl ? ' @ ' + c.baseUrl : ''} (Settings → Model)`;
                 } else {
                     el.textContent = '— select a model —';
                 }
-            } catch (e) { /* non-fatal */ }
+            }
+
+            // Settings → Model Selection "Active model" card
+            const sm = document.getElementById('settingsActiveModel');
+            const se = document.getElementById('settingsActiveEndpoint');
+            if (sm) {
+                if (c && c.model) {
+                    sm.textContent = `${c.provider} · ${c.model}`;
+                    if (se) se.textContent = c.baseUrl ? `endpoint: ${c.baseUrl}` : '';
+                } else {
+                    sm.textContent = '— none selected —';
+                    if (se) se.textContent = '';
+                }
+            }
         }
 
         function useManualModel() {

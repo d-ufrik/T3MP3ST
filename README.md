@@ -33,9 +33,17 @@ This fork adds **local-inference support and live model discovery** on top of up
 - **Use your own local inference.** Point T3MP3ST at anything **OpenAI-compatible** you've already deployed (vLLM, llama.cpp, LM Studio, Ollama's OpenAI shim, an in-house proxy) via a new **`custom`** provider — set a base URL, key optional (keyless servers work).
 - **Added NVIDIA as a provider** — NVIDIA NIM (`integrate.api.nvidia.com/v1`), because the API keys are free. 😄
 - **Model retrieval instead of hardcoded lists** — fetches the latest model list straight from each provider's own `/models` endpoint, so the catalog is never stale (the old hardcoded list is now just an offline fallback).
-- **Fixed a routing bug** where everything defaulted through OpenRouter regardless of the selected provider — now the provider you pick actually drives missions, the Admiral, and chat (incl. your local box).
+- **Fixed the routing bug** where everything defaulted through OpenRouter regardless of the selected provider — now the provider you pick actually drives missions, the Admiral, and chat (incl. your local box). This included a second hardcoded path in **Op Admiral** that forced any `sk-…` key to OpenAI (`401` errors); it honors your selection now too.
+- **Active-backbone visibility** — the Admiral panel shows a live `provider · model` badge and logs the exact backbone it's using, so it's always clear which model is running the op.
 
-Full details: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) · local setup: [`docs/LOCAL_MODELS.md`](docs/LOCAL_MODELS.md) · the routing fix: [`docs/ROUTING_FIX.md`](docs/ROUTING_FIX.md) · Docker/ops: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). No secrets ship in the image — keys are injected at runtime.
+📖 **Docs:** local setup → [`docs/LOCAL_MODELS.md`](docs/LOCAL_MODELS.md) · the routing fix → [`docs/ROUTING_FIX.md`](docs/ROUTING_FIX.md) · Docker/ops → [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). No secrets ship in the image — keys are injected at runtime.
+
+### 📓 Changelog
+
+Full history: **[`docs/CHANGELOG.md`](docs/CHANGELOG.md)**. Latest:
+
+- **2026-07-05 (patch)** — Op Admiral now routes to the selected provider (was forcing `sk-` keys to OpenAI); added the active-backbone badge + log line.
+- **2026-07-05** — Local OpenAI-compatible inference (`custom` provider), NVIDIA NIM provider, live `/models` discovery (no more hardcoded lists), the OpenRouter routing fix, and a secret-free Docker image.
 
 ---
 

@@ -770,6 +770,15 @@ class ConfigManager {
         baseUrl = 'http://localhost:11434/api';
         actualModel = model || 'llama3';
         break;
+      case 'local-agent': {
+        // Connected local agent CLI (Claude Code / Codex / Hermes) driven as the backbone.
+        // No API key / baseUrl — each CLI uses its own login. The agent id travels in `model`;
+        // it lives in the top-level defaultModel once local-agent is the default provider.
+        const stored = this.config.get('defaultModel');
+        const known = ['codex', 'claude', 'hermes'];
+        actualModel = model || (known.includes(stored) ? stored : 'claude');
+        break;
+      }
       default:
         throw new Error(`Unknown provider: ${actualProvider}`);
     }
